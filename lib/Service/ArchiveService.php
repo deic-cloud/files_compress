@@ -66,14 +66,20 @@ class ArchiveService {
 		// relative paths. Array form of proc_open => no shell => no injection.
 		// zip has no "--" end-of-options marker, so prefix every name with
 		// "./" to neutralise any leading-dash file names instead.
-		$args = ['zip', '-r', '-q', './' . $destName];
-		foreach ($nodes as $n) {
-			$args[] = './' . $n->getName();
-		}
-		[$code, , $err] = $this->run($args, $parentLocal);
-		if ($code !== 0) {
-			$this->logger->error('files_compress: zip exited ' . $code . ': ' . $err, ['app' => 'files_compress']);
-			throw new ArchiveException($this->l->t('Compression failed.'));
+		if ($this->hasProgram('zip')) {
+			$args = ['zip', '-r', '-q', './' . $destName];
+			foreach ($nodes as $n) {
+				$args[] = './' . $n->getName();
+			}
+			[$code, , $err] = $this->run($args, $parentLocal);
+			if ($code !== 0) {
+				$this->logger->error('files_compress: zip exited ' . $code . ': ' . $err, ['app' => 'files_compress']);
+				throw new ArchiveException($this->l->t('Compression failed.'));
+			}
+		} else {
+			// No Info-ZIP `zip` (FreeBSD base has only unzip): PHP's zip
+			// extension, which Nextcloud requires anyway.
+			$this->zipWithPhp($parentLocal, $destName, array_map(static fn ($n) => $n->getName(), $nodes));
 		}
 
 		$this->rescan($parent, $destName);
@@ -218,6 +224,58 @@ class ArchiveService {
 			$parent->getStorage()->getScanner()->scan($path);
 		} catch (\Throwable $e) {
 			$this->logger->warning('files_compress: scan of ' . $path . ' failed: ' . $e->getMessage(), ['app' => 'files_compress']);
+		}
+	}
+
+	/** Is $program on the tool PATH (self::ENV)? */
+	private function hasProgram(string $program): bool {
+		foreach (explode(':', self::ENV['PATH'] ?? '/usr/local/bin:/usr/bin:/bin') as $dir) {
+			if ($dir !== '' && is_executable(rtrim($dir, '/') . '/' . $program)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * Write $destName in $cwd with the given entries (files or folders,
+	 * recursively), storing relative paths — what `zip -r` does. Symbolic links
+	 * are skipped, never followed. Files are added from disk, not read into memory.
+	 *
+	 * @param string[] $names entries directly inside $cwd
+	 */
+	private function zipWithPhp(string $cwd, string $destName, array $names): void {
+		if (!class_exists(\ZipArchive::class)) {
+			throw new ArchiveException($this->l->t('Compression is not available on this server.'));
+		}
+		$zip = new \ZipArchive();
+		$dest = rtrim($cwd, '/') . '/' . $destName;
+		if ($zip->open($dest, \ZipArchive::CREATE | \ZipArchive::EXCL) !== true) {
+			throw new ArchiveException($this->l->t('Compression failed.'));
+		}
+		$add = function (string $rel) use (&$add, $zip, $cwd): void {
+			$abs = rtrim($cwd, '/') . '/' . $rel;
+			if (is_link($abs)) {
+				return;
+			}
+			if (is_dir($abs)) {
+				$zip->addEmptyDir($rel);
+				foreach (scandir($abs) ?: [] as $child) {
+					if ($child !== '.' && $child !== '..') {
+						$add($rel . '/' . $child);
+					}
+				}
+			} elseif (is_file($abs)) {
+				$zip->addFile($abs, $rel);
+			}
+		};
+		foreach ($names as $name) {
+			$add($name);
+		}
+		if (!$zip->close()) {
+			@unlink($dest);
+			$this->logger->error('files_compress: ZipArchive failed writing ' . $dest, ['app' => 'files_compress']);
+			throw new ArchiveException($this->l->t('Compression failed.'));
 		}
 	}
 
