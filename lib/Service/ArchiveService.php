@@ -222,12 +222,37 @@ class ArchiveService {
 	}
 
 	/**
+	 * The program by its full path, found in self::ENV's PATH. For the array
+	 * form, proc_open() looks a bare name up in the WEB SERVER's own PATH, not in
+	 * the environment it passes on — Apache on FreeBSD has no /usr/local/bin,
+	 * where packages such as zip live, so 'zip' failed with "posix_spawn()
+	 * failed: No such file or directory" although it was installed.
+	 *
+	 * @param string[] $cmd
+	 * @return string[]
+	 */
+	private function resolveProgram(array $cmd): array {
+		if ($cmd === [] || str_contains($cmd[0], '/')) {
+			return $cmd;
+		}
+		foreach (explode(':', self::ENV['PATH']) as $dir) {
+			$candidate = rtrim($dir, '/') . '/' . $cmd[0];
+			if ($dir !== '' && is_file($candidate) && is_executable($candidate)) {
+				$cmd[0] = $candidate;
+				return $cmd;
+			}
+		}
+		throw new ArchiveException($this->l->t('The archive tool "%s" is not installed on this server.', [$cmd[0]]));
+	}
+
+	/**
 	 * Run a command (array form => no shell). Returns [exitCode, stdout, stderr].
 	 *
 	 * @param string[] $cmd
 	 * @return array{0: int, 1: string, 2: string}
 	 */
 	private function run(array $cmd, ?string $cwd): array {
+		$cmd = $this->resolveProgram($cmd);
 		$desc = [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
 		$proc = proc_open($cmd, $desc, $pipes, $cwd, self::ENV);
 		if (!is_resource($proc)) {
@@ -250,6 +275,7 @@ class ArchiveService {
 	 * @return array{0: int, 1: string, 2: string}
 	 */
 	private function runToFile(array $cmd, string $destLocal): array {
+		$cmd = $this->resolveProgram($cmd);
 		$desc = [0 => ['pipe', 'r'], 1 => ['file', $destLocal, 'w'], 2 => ['pipe', 'w']];
 		$proc = proc_open($cmd, $desc, $pipes, null, self::ENV);
 		if (!is_resource($proc)) {
